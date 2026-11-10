@@ -1,24 +1,41 @@
 # Stone Paper Scissors (online, 2 players)
 
-A static web game. Two players enter their names, one sets the target score, and the first to reach it wins.
-Players connect browser-to-browser (WebRTC via PeerJS), so it runs on GitHub Pages with no server of your own.
-Moves are committed with a SHA-256 hash and revealed together, so neither player can peek or change a choice.
+Static web game for GitHub Pages. Players send their moves through a free Firebase Realtime Database,
+so it works between any two networks (home Wi-Fi, mobile data, different countries).
+Moves are committed with a SHA-256 hash and revealed together, so nobody can peek or change a choice.
 
 ## Files
-- `index.html`, `style.css`, `game.js` – the game
-- `vendor/peerjs.min.js` – PeerJS 1.5.4 (bundled so there is no CDN dependency)
+index.html, style.css, game.js, config.js (your Firebase URL goes here)
 
-## Run locally
-Open `index.html` through any static server, e.g. `python3 -m http.server 8000` and visit http://localhost:8000
-(WebRTC and crypto need `localhost` or HTTPS, so don't open it with `file://`).
+## Step A – Create the free Firebase database (about 5 minutes)
+1. Go to https://console.firebase.google.com and sign in with a Google account.
+2. Click **Create a project**, give it a name, and finish (Google Analytics can be turned off).
+3. In the left menu open **Build → Realtime Database**, click **Create Database**, pick a location,
+   and choose **Start in locked mode**.
+4. Open the **Rules** tab, replace everything with the text below, and click **Publish**:
 
-## Host on GitHub Pages
-1. Create a new public repository on GitHub (e.g. `stone-paper-scissors`).
-2. Upload all files in this folder to the repository root (or `git push` them).
-3. Go to **Settings → Pages**. Under **Build and deployment**, choose **Deploy from a branch**, branch `main`, folder `/ (root)`, then Save.
-4. After a minute your game is live at `https://<your-username>.github.io/stone-paper-scissors/`.
+       {
+         "rules": {
+           "rooms": {
+             "$room": { ".read": true, ".write": true }
+           }
+         }
+       }
+
+5. Open the **Data** tab. Copy the database URL shown at the top
+   (it looks like `https://your-project-default-rtdb.firebaseio.com`).
+6. Open `config.js`, paste the URL between the quotes, and save.
+
+## Step B – Put it on GitHub Pages
+1. Upload all files to your repository (replace the old ones; delete the old `vendor` folder if it is still there).
+2. Settings → Pages → Deploy from a branch → `main` / `(root)` → Save.
+3. Your game is live at `https://<your-username>.github.io/<repo-name>/`.
+
+## Play
+Player 1: name + target score + **Create game**, then share the link or code.
+Player 2: open the link, type a name, click **Join game**.
 
 ## Notes
-- Signalling uses the free public PeerJS cloud server; the game traffic itself is peer-to-peer.
-- Players on very strict corporate networks may fail to connect, since no TURN relay is configured.
-- To self-host signalling later, run `peerjs-server` and pass `{host, port, path}` to `new Peer(...)` in `game.js`.
+- Rooms are only reachable by their 5-letter code (the rules do not allow listing rooms).
+- The host's room is deleted when the host clicks Leave game.
+- The Firebase free plan is more than enough for casual play.

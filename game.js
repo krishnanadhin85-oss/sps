@@ -2,17 +2,20 @@
 const $ = s => document.querySelector(s), app = $('#app');
 const C = { stone: ['✊', 'Stone'], paper: ['✋', 'Paper'], scissors: ['✌️', 'Scissors'] };
 const beats = { stone: 'scissors', paper: 'stone', scissors: 'paper' };
-const PREFIX = 'spsgame-';           // namespace for peer IDs on the PeerJS cloud
 const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const sha = async s => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))]
   .map(b => b.toString(16).padStart(2, '0')).join('');
 const rnd = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => 'abcdefghjkmnpqrstuvwxyz23456789'[b % 31]).join('');
 
-let peer = null, conn = null, G = null, savedName = '';
+const DB = (typeof DB_URL === 'string' ? DB_URL : '').replace(/\/$/, '');
+const ME = rnd(10);
+let es = null, G = null, savedName = '', seen = new Set();
 
 function lobby(err) {
   const pre = new URLSearchParams(location.search).get('g') || '';
+  const notSet = !DB.startsWith('https://');
   app.innerHTML = `<div class="card">
+    ${notSet ? '<p class="msg bad">Setup needed: open config.js and paste your Firebase database URL (see README).</p>' : ''}
     <label>Your name</label><input id="nm" maxlength="20" placeholder="Enter your name" value="${esc(savedName)}">
     <label>Target score (when creating a game)</label><input id="tg" type="number" min="1" max="50" value="3">
     <button class="p" id="mk">Create game</button>
@@ -24,71 +27,84 @@ function lobby(err) {
   $('#jn').onclick = () => start(false);
 }
 
+const url = code => `${DB}/rooms/${code}/msgs.json`;
+const send = m => fetch(url(G.code), { method: 'POST', body: JSON.stringify({ ...m, from: ME }) }).catch(() => {});
+
 function cleanup() {
-  if (conn) try { conn.close(); } catch (e) {}
-  if (peer) try { peer.destroy(); } catch (e) {}
-  conn = peer = G = null;
+  if (es) es.close();
+  es = null; G = null; seen = new Set();
 }
 
-function start(host, retry = 0) {
-  const name = $('#nm') ? $('#nm').value.trim() : savedName;
-  const tInput = $('#tg') ? parseInt($('#tg').value) : 3;
-  const code = host ? (G && G.code && retry ? rnd(5) : rnd(5))
-                    : $('#cd').value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+async function start(host) {
+  const name = $('#nm').value.trim();
+  const tInput = parseInt($('#tg').value);
+  if (!DB.startsWith('https://')) return lobby('Setup needed: add your Firebase URL in config.js.');
   if (!name) return lobby('Please type your name.');
+  let code = host ? rnd(5) : $('#cd').value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
   if (code.length < 3) return lobby('Please enter the game code.');
   savedName = name;
   cleanup();
   G = { name, code, host, target: host ? Math.max(1, Math.min(50, tInput || 3)) : null,
-        oppName: null, r: 1, meS: 0, oppS: 0, pick: null, last: null, over: false,
+        oppId: null, oppName: null, r: 1, meS: 0, oppS: 0, pick: null, last: null, over: false,
         resolved: 0, oppCommit: {}, oppReveal: {}, status: 'Connecting…' };
   draw();
-  peer = host ? new Peer(PREFIX + code) : new Peer();
-  peer.on('open', () => {
-    if (host) { G.status = 'waiting'; draw(); }
-    else { setup(peer.connect(PREFIX + code, { reliable: true })); }
-  });
-  peer.on('connection', c => {                    // host side
-    if (conn) { c.on('open', () => c.close()); return; }   // room is full
-    setup(c);
-  });
-  peer.on('error', e => {
-    if (e.type === 'unavailable-id' && host && retry < 3) return start(true, retry + 1);
-    const m = e.type === 'peer-unavailable' ? 'Game not found. Check the code.' :
-              'Connection problem (' + e.type + '). Please try again.';
-    cleanup(); lobby(m);
-  });
+  try {
+    for (let i = 0; host && i < 5; i++) {              // make sure the code is unused
+      const ex = await (await fetch(url(G.code))).json();
+      if (ex === null) break;
+      G.code = code = rnd(5);
+    }
+    if (!host) {
+      const ex = await (await fetch(url(code))).json();
+      if (ex === null) { cleanup(); return lobby('Game not found. Check the code.'); }
+    }
+  } catch (e) { cleanup(); return lobby('Cannot reach the game server. Check your internet and config.js.'); }
+  listen();
+  send({ t: 'hello', name, target: host ? G.target : undefined });
+  draw();
 }
 
-function setup(c) {
-  conn = c;
-  const hello = () => c.send({ t: 'hello', name: G.name, target: G.host ? G.target : undefined });
-  if (c.open) hello(); else c.on('open', hello);
-  c.on('data', onMsg);
-  c.on('close', () => { if (G) { G.left = true; draw(); } });
+function listen() {
+  es = new EventSource(url(G.code));
+  const ingest = (k, v) => {
+    if (seen.has(k)) return; seen.add(k);
+    if (v && typeof v === 'object' && v.from !== ME) onMsg(v);
+  };
+  const handle = e => {
+    let d; try { d = JSON.parse(e.data); } catch (x) { return; }
+    if (!d || d.path == null) return;
+    if (d.path === '/') { if (d.data && typeof d.data === 'object') for (const k in d.data) ingest(k, d.data[k]); }
+    else { const p = d.path.split('/'); if (p.length === 2) ingest(p[1], d.data); }
+  };
+  es.addEventListener('put', handle);
+  es.addEventListener('patch', handle);
+  es.onerror = () => { if (es && es.readyState === 2 && G) { G.status = 'Connection lost.'; G.left = true; draw(); } };
 }
 
 function onMsg(m) {
-  if (!G || !m || typeof m !== 'object') return;
+  if (!G) return;
   if (m.t === 'hello') {
+    if (G.oppId && G.oppId !== m.from) return;          // room already has two players
+    G.oppId = m.from;
     G.oppName = String(m.name || 'Opponent').slice(0, 20);
     if (!G.host && Number.isInteger(m.target)) G.target = Math.max(1, Math.min(50, m.target));
-  } else if (m.t === 'commit' && Number.isInteger(m.r) && typeof m.h === 'string') {
-    G.oppCommit[m.r] = m.h;
-  } else if (m.t === 'reveal' && Number.isInteger(m.r) && beats[m.c] && typeof m.s === 'string') {
-    G.oppReveal[m.r] = { c: m.c, s: m.s };
+    return check();
   }
+  if (m.from !== G.oppId) return;
+  if (m.t === 'commit' && Number.isInteger(m.r) && typeof m.h === 'string') G.oppCommit[m.r] = m.h;
+  else if (m.t === 'reveal' && Number.isInteger(m.r) && beats[m.c] && typeof m.s === 'string') G.oppReveal[m.r] = { c: m.c, s: m.s };
+  else if (m.t === 'bye') { G.left = true; return draw(); }
   check();
 }
 
 async function choose(c) {
-  if (G.pick || G.over || !conn) return;
+  if (G.pick || G.over || !G.oppId) return;
   const salt = rnd(12);
   G.pick = { c, salt, revealed: false };
   draw();
   const h = await sha(c + ':' + salt);
   G.pick.h = h;
-  conn.send({ t: 'commit', r: G.r, h });
+  send({ t: 'commit', r: G.r, h });
   check();
 }
 
@@ -97,7 +113,7 @@ async function check() {
   const r = G.r;
   if (!G.pick.revealed && G.oppCommit[r]) {       // both committed → reveal
     G.pick.revealed = true;
-    conn.send({ t: 'reveal', r, c: G.pick.c, s: G.pick.salt });
+    send({ t: 'reveal', r, c: G.pick.c, s: G.pick.salt });
   }
   const rv = G.oppReveal[r];
   if (G.pick.revealed && rv && G.resolved < r) {
@@ -116,7 +132,11 @@ async function check() {
 }
 
 function again() { G.meS = 0; G.oppS = 0; G.over = false; G.last = null; G.pick = null; G.r++; draw(); }
-function leave() { cleanup(); history.replaceState(null, '', location.pathname); lobby(); }
+function leave() {
+  if (G) { send({ t: 'bye' }); if (G.host) fetch(`${DB}/rooms/${G.code}.json`, { method: 'DELETE' }).catch(() => {}); }
+  cleanup(); history.replaceState(null, '', location.pathname); lobby();
+addEventListener('pagehide', () => { if (G) fetch(url(G.code), { method: 'POST', body: JSON.stringify({ t: 'bye', from: ME }), keepalive: true }); });
+}
 
 function draw() {
   if (!G) return;
@@ -158,3 +178,4 @@ function draw() {
 }
 
 lobby();
+addEventListener('pagehide', () => { if (G) fetch(url(G.code), { method: 'POST', body: JSON.stringify({ t: 'bye', from: ME }), keepalive: true }); });
